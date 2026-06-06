@@ -21,19 +21,45 @@ type SaveAllRequest struct {
 	Bindings          []BindingRequest `json:"bindings"`
 }
 
-func checkOverlap(existing []models.RegisterBinding, newSensorID uint, newStart, newCount int, excludeID uint) (bool, string) {
-	newEnd := newStart + newCount - 1
-	if newEnd > 40100 {
-		return true, "传感器地址范围超出 40100 边界"
-	}
-
+func buildOccupiedMap(existing []models.RegisterBinding, excludeID uint) (map[int]models.RegisterBinding, error) {
+	occupied := make(map[int]models.RegisterBinding)
 	for _, b := range existing {
 		if b.ID == excludeID {
 			continue
 		}
-		existEnd := b.StartAddress + b.SensorType.RegCount - 1
-		if !(newEnd < b.StartAddress || newStart > existEnd) {
-			return true, fmt.Sprintf("与传感器 \"%s\" (地址 %d-%d) 内存重叠", b.SensorType.Name, b.StartAddress, existEnd)
+		var sensor models.SensorType
+		if err := database.DB.First(&sensor, b.SensorTypeID).Error; err != nil {
+			return nil, fmt.Errorf("传感器类型查询失败: %w", err)
+		}
+		regCount := sensor.RegCount
+		if regCount <= 0 {
+			regCount = 1
+		}
+		b.SensorType = sensor
+		for i := 0; i < regCount; i++ {
+			addr := b.StartAddress + i
+			occupied[addr] = b
+		}
+	}
+	return occupied, nil
+}
+
+func checkAddressConflict(startAddress int, regCount int, occupied map[int]models.RegisterBinding) (bool, string) {
+	if regCount <= 0 {
+		return true, "传感器寄存器数量无效"
+	}
+	endAddress := startAddress + regCount - 1
+	if endAddress > 40100 {
+		return true, fmt.Sprintf("地址范围超出边界: %d-%d 超过 40100", startAddress, endAddress)
+	}
+	for i := 0; i < regCount; i++ {
+		addr := startAddress + i
+		if conflict, exists := occupied[addr]; exists {
+			conflictEnd := conflict.StartAddress + conflict.SensorType.RegCount - 1
+			return true, fmt.Sprintf(
+				"地址 %d 与传感器 \"%s\" (占用 %d-%d) 重叠",
+				addr, conflict.SensorType.Name, conflict.StartAddress, conflictEnd,
+			)
 		}
 	}
 	return false, ""
@@ -159,10 +185,21 @@ func CreateRegisterBinding(c *gin.Context) {
 		return
 	}
 
-	var existing []models.RegisterBinding
-	database.DB.Preload("SensorType").Where("gateway_template_id = ?", req.GatewayTemplateID).Find(&existing)
+	if sensor.RegCount <= 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "传感器寄存器数量配置无效"})
+		return
+	}
 
-	if overlap, msg := checkOverlap(existing, req.SensorTypeID, req.StartAddress, sensor.RegCount, 0); overlap {
+	var existing []models.RegisterBinding
+	database.DB.Where("gateway_template_id = ?", req.GatewayTemplateID).Find(&existing)
+
+	occupied, err := buildOccupiedMap(existing, 0)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	if conflict, msg := checkAddressConflict(req.StartAddress, sensor.RegCount, occupied); conflict {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "地址冲突: " + msg})
 		return
 	}
@@ -201,10 +238,21 @@ func UpdateRegisterBinding(c *gin.Context) {
 		return
 	}
 
-	var existing []models.RegisterBinding
-	database.DB.Preload("SensorType").Where("gateway_template_id = ?", req.GatewayTemplateID).Find(&existing)
+	if sensor.RegCount <= 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "传感器寄存器数量配置无效"})
+		return
+	}
 
-	if overlap, msg := checkOverlap(existing, req.SensorTypeID, req.StartAddress, sensor.RegCount, binding.ID); overlap {
+	var existing []models.RegisterBinding
+	database.DB.Where("gateway_template_id = ?", req.GatewayTemplateID).Find(&existing)
+
+	occupied, err := buildOccupiedMap(existing, binding.ID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	if conflict, msg := checkAddressConflict(req.StartAddress, sensor.RegCount, occupied); conflict {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "地址冲突: " + msg})
 		return
 	}
@@ -241,25 +289,29 @@ func SaveAllBindings(c *gin.Context) {
 				c.JSON(http.StatusBadRequest, gin.H{"error": "传感器类型不存在"})
 				return
 			}
+			if s.RegCount <= 0 {
+				c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("传感器 \"%s\" 寄存器数量配置无效", s.Name)})
+				return
+			}
 			sensorMap[b.SensorTypeID] = s
 		}
 	}
 
+	occupied := make(map[int]string)
 	for i, b := range req.Bindings {
 		s := sensorMap[b.SensorTypeID]
 		end := b.StartAddress + s.RegCount - 1
 		if end > 40100 {
-			c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("第 %d 个传感器地址范围超出 40100 边界", i+1)})
+			c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("第 %d 个传感器 \"%s\" 地址范围 %d-%d 超出 40100 边界", i+1, s.Name, b.StartAddress, end)})
 			return
 		}
-		for j := 0; j < i; j++ {
-			prev := req.Bindings[j]
-			prevS := sensorMap[prev.SensorTypeID]
-			prevEnd := prev.StartAddress + prevS.RegCount - 1
-			if !(end < prev.StartAddress || b.StartAddress > prevEnd) {
-				c.JSON(http.StatusBadRequest, gin.H{"error": "传感器 \"" + s.Name + "\" 与 \"" + prevS.Name + "\" 地址重叠"})
+		for j := 0; j < s.RegCount; j++ {
+			addr := b.StartAddress + j
+			if existName, exists := occupied[addr]; exists {
+				c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("地址 %d 冲突: \"%s\" 与 \"%s\" 重叠", addr, existName, s.Name)})
 				return
 			}
+			occupied[addr] = s.Name
 		}
 	}
 

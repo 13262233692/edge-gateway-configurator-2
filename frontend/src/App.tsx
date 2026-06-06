@@ -77,22 +77,38 @@ function App() {
   const getOccupiedMap = () => {
     const map = new Map<number, { sensor: SensorType; bindingId: number }>();
     bindings.forEach((b) => {
-      for (let i = 0; i < b.sensorType.regCount; i++) {
+      const regCount = b.sensorType.regCount > 0 ? b.sensorType.regCount : 1;
+      for (let i = 0; i < regCount; i++) {
         map.set(b.startAddress + i, { sensor: b.sensorType, bindingId: b.id });
       }
     });
     return map;
   };
 
-  const checkValidDrop = (address: number, sensor: SensorType): boolean => {
+  const checkValidDrop = (address: number, sensor: SensorType): { valid: boolean; reason?: string } => {
+    if (sensor.regCount <= 0) {
+      return { valid: false, reason: '传感器寄存器数量配置无效' };
+    }
     const endAddr = address + sensor.regCount - 1;
-    if (endAddr > END_ADDR) return false;
+    if (endAddr > END_ADDR) {
+      return { valid: false, reason: `地址范围 ${address}-${endAddr} 超出 40100 边界` };
+    }
 
     const occupied = getOccupiedMap();
     for (let i = 0; i < sensor.regCount; i++) {
-      if (occupied.has(address + i)) return false;
+      const addr = address + i;
+      if (occupied.has(addr)) {
+        const conflict = occupied.get(addr)!;
+        const conflictEnd = conflict.sensor.regCount > 0
+          ? conflict.sensor.regCount
+          : 1;
+        return {
+          valid: false,
+          reason: `地址 ${addr} 与传感器 \"${conflict.sensor.name}\" 重叠`,
+        };
+      }
     }
-    return true;
+    return { valid: true };
   };
 
   const handleDragStart = (event: DragStartEvent) => {
@@ -127,8 +143,9 @@ function App() {
     const address = parseInt(overId.replace('cell-', ''));
     const sensor = activeData.sensor as SensorType;
 
-    if (!checkValidDrop(address, sensor)) {
-      showMessage('error', '地址无效或与已有传感器重叠');
+    const { valid, reason } = checkValidDrop(address, sensor);
+    if (!valid) {
+      showMessage('error', reason || '地址无效或与已有传感器重叠');
       return;
     }
 
@@ -258,9 +275,9 @@ function App() {
                       overAddress !== null &&
                       addr >= overAddress &&
                       addr < overAddress + activeSensor.regCount;
-                    const isValidDrop = activeSensor
+                    const dropResult = activeSensor
                       ? checkValidDrop(overAddress || addr, activeSensor)
-                      : false;
+                      : { valid: false };
                     return (
                       <RegisterCell
                         key={addr}
@@ -269,7 +286,7 @@ function App() {
                         sensor={occupied?.sensor}
                         bindingId={occupied?.bindingId}
                         isOver={isOver}
-                        isValidDrop={isValidDrop}
+                        isValidDrop={dropResult.valid}
                         onRemove={handleRemoveBinding}
                       />
                     );
